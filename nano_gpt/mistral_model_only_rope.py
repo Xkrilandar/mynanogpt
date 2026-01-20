@@ -14,35 +14,76 @@ class GPTConfig:
     dropout: float = 0.1
     bias: bool = True
 
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    x:   (B, n_head, T, head_dim)
+    cos: (1, 1, T, head_dim)
+    sin: (1, 1, T, head_dim)
+    """
+    x_even = x[..., ::2]
+    x_odd  = x[..., 1::2]
+    x_rot = torch.stack((-x_odd, x_even), dim=-1)
+    x_half_rotated = x_rot.flatten(-2)
+    return (x * cos) + (x_half_rotated * sin)
+
 class CausalSelfAttention(nn.Module):
     """Multi-head masked self-attention with optional Flash Attention support."""
-    def __init__(self, config):
+    def __init__(self, config, block_size, rope_base=10000.0):
         super().__init__()
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
         self.dropout = config.dropout
         self.n_embd = config.n_embd
+        C = self.n_embd
+        Dh = self.head_size
+        Hq = self.n_head
+        T = block_size
 
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        assert Dh % 2 == 0, "RoPE requires head_dim to be even."
+
+        self.c_attn = nn.Linear(C, 3 * C, bias=config.bias)
+        self.c_proj = nn.Linear(C, C, bias=config.bias)
 
         self.dropout_1 = nn.Dropout(config.dropout)
         self.dropout_2 = nn.Dropout(config.dropout)
 
-        self.register_buffer("causal_mask", torch.tril(torch.ones(block_size, block_size,dtype=torch.bool)).view(1, 1, block_size, block_size))
+        self.register_buffer("causal_mask", torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T))
+
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
+        rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
+        self.register_buffer("rope_freqs", rope_freqs.permute(0, 1, 3, 2))
+
 
     def forward(self, x):
-        print("Attention input shape", x.shape)
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd) 
+        print("B, T, C", B, T, C)
+        Dh = self.head_size
+        Hq = self.n_head
+        assert C % self.n_head == 0
+        print("Dh, Hq", Dh, Hq)
+        q, k, v = self.c_attn(x).split(C, dim=2)
 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2) 
+        Q = q.view(B, T, Hq, Dh)
+        Q = Q.transpose(1,2)
 
-        Q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-        K = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-        V = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2) 
+        K = k.view(B, T, Hq, Dh).transpose(1,2)
+        V = v.view(B, T, Hq, Dh).transpose(1,2)
+
+        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
+
+        print("self rope freqs shape", self.rope_freqs.shape)
+        cos = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].cos(), 2, dim=-1)
+        sin = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].sin(), 2, dim=-1)
+        print("Q shape", Q.shape)
+        print("K shape", K.shape)
+        print("cos shape", cos.shape)
+        print("sin shape", sin.shape)
+        Q = apply_rope(Q, cos, sin)
+        K = apply_rope(K, cos, sin)
 
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
         print("causal mask shape", self.causal_mask.shape)
+        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
         mask = self.causal_mask[:, :, :T, :T]      # (1,1,T,T)
         valid = mask.any(dim=-1)                    # (1,1,T)
         assert valid.all(), "Attention mask has invalid rows"
@@ -99,7 +140,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, block_size) for _ in range(config.n_layer)]),
             ln_f = nn.RMSNorm(config.n_embd, eps=1e-5),
@@ -126,9 +166,7 @@ class GPT(nn.Module):
         print("idx:", idx)
 
         tok_embd = self.transformer.wte(idx)
-        pos=torch.arange(0, t, dtype=torch.long, device=device)
-        pos_embd = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_embd + pos_embd)
+        x = self.transformer.drop(tok_embd)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
