@@ -4,6 +4,8 @@ import torch.nn as nn
 from dataclasses import dataclass
 import torch.nn.functional as F
 
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
 @dataclass
 class GPTConfig:
@@ -27,79 +29,82 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_half_rotated = x_rot.flatten(-2)
     return (x * cos) + (x_half_rotated * sin)
 
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head masked self-attention with optional Flash Attention support."""
     def __init__(self, config, block_size, rope_base=10000.0):
         super().__init__()
-        self.n_head = config.n_head
-        self.head_size = config.n_embd // config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.dropout = config.dropout
-        self.n_embd = config.n_embd
-        C = self.n_embd
-        Dh = self.head_size
-        Hq = self.n_head
-        Hkv = self.n_kv_head
-        T = block_size
+        self.T = block_size
+        self.C = config.n_embd
+        self.H = config.n_head
+        self.Hkv = config.n_kv_head
+        T, C, H = self.T, self.C, self.H
+        self.Dh = C // H
+        Dh = self.Dh
+        Hkv = self.Hkv
+        self.proj = nn.Linear(C, C, bias=False)
 
         assert Dh % 2 == 0, "RoPE requires head_dim to be even."
-        assert Hq % Hkv == 0, "Number of query heads must be divisible by number of key/value heads."
-
-        self.c_attn = nn.Linear(C, (Hq + 2 * Hkv) * Dh, bias=config.bias)
-        self.c_proj = nn.Linear(C, C, bias=config.bias)
-
-        self.dropout_1 = nn.Dropout(config.dropout)
-        self.dropout_2 = nn.Dropout(config.dropout)
-
-        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T)
-        self.register_buffer("causal_mask", causal_mask)
-
+        assert H % Hkv == 0, "Number of query heads must be divisible by number of key/value heads."
+        self.attn = nn.Linear(C, (H + 2 * Hkv) * Dh, bias=False)
+        
+        self.register_buffer("causal_mask", torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1,1,T,T), persistent=False)
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
         rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
         self.register_buffer("rope_freqs", rope_freqs.permute(0, 1, 3, 2))
 
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd) 
-        print("B, T, C", B, T, C)
-        Dh = self.head_size
-        Hq = self.n_head
-        Hkv = self.n_kv_head
-        assert C % self.n_head == 0
-        print("Dh, Hq, Hkv", Dh, Hq, Hkv)
-        q, k, v = self.c_attn(x).split([Hq*Dh, Hkv*Dh, Hkv*Dh], dim=2)
-
-        Q = q.view(B, T, Hq, Dh)
-        Q = Q.transpose(1,2)
-
+    def forward(self, x, use_cache=False, past_kv_cache=False):
+        B, T, C = x.size()
+        assert T== self.T 
+        assert C == self.C
+        H = self.H
+        Hkv = self.Hkv
+        Dh = self.Dh
+        attn = self.attn(x)
+        assert C % H == 0
+        print("attn", attn.shape)
+        q,k,v = attn.split([H*Dh,Hkv*Dh,Hkv*Dh], dim=2)
+        print("q", q.shape)
+        Q = q.view(B, T, H, Dh).transpose(1,2)
         K = k.view(B, T, Hkv, Dh).transpose(1,2)
         V = v.view(B, T, Hkv, Dh).transpose(1,2)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
-        K = K.repeat_interleave(Hq // Hkv, dim=1)
-        V = V.repeat_interleave(Hq // Hkv, dim=1)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
 
-        print("self rope freqs shape", self.rope_freqs.shape)
         cos = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].cos(), 2, dim=-1)
         sin = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].sin(), 2, dim=-1)
         Q = apply_rope(Q, cos, sin)
         K = apply_rope(K, cos, sin)
+        Q = norm(Q)
+        K = norm(K)
+        #scores = Q @ K.transpose(3,2)
+        g = H // Hkv
+        Qg = Q.view(B, Hkv, g, T, Dh)
+        print("Qg", Qg.shape)
+        print("K", K.shape)
+        scores = torch.einsum("bhgtd,bhsd->bhgts", Qg, K)
+        # equivalent to 
+        #scores = Qg @ K.unsqueeze(2).transpose(-1,-2)
+        scores = scores / math.sqrt(Dh)
 
-        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
-        print("causal mask shape", self.causal_mask.shape)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
 
-        attn = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
-        attn = F.softmax(attn, -1)
-        attn = self.dropout_1(attn) 
-        attn = attn @ V 
-
-        y = attn.transpose(2,1).reshape(B, T, C)
-        y = self.c_proj(y) 
-        y = self.dropout_2(y)
-        print("Attention output shape", y.shape)
+        print("scores", scores.shape)
+        #scores = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float("-inf"))
+        scores = scores.masked_fill(~self.causal_mask[:,:,:T,:T].unsqueeze(2), float("-inf"))
+        attn = F.softmax(scores, dim=-1)
+        #y = attn @ V
+        print("attn", attn.shape)
+        print("V", V.shape)
+        #Yg = torch.einsum("bhgts,bhsd->bhgtd", attn, V)
+        # equivalent to 
+        Yg = attn @ V.unsqueeze(2)
+        y = Yg.reshape(B, H, T, Dh).transpose(1, 2)
+        y = y.contiguous().view(B,T,-1)
+        y = self.proj(y)
+        y = norm(y)
         return y
+
+
 
 
 class MLP(nn.Module):
@@ -145,7 +150,6 @@ class GPT(nn.Module):
             wte = nn.Embedding(vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, block_size) for _ in range(config.n_layer)]),
-            ln_f = nn.RMSNorm(config.n_embd, eps=1e-5),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, vocab_size, bias=False)
@@ -172,7 +176,7 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = norm(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None

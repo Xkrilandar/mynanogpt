@@ -4,16 +4,19 @@ import torch.nn as nn
 from dataclasses import dataclass
 import torch.nn.functional as F
 
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
 @dataclass
 class GPTConfig:
     """Configuration class for the GPT model."""
-    n_layer: int = 1
+    n_layer: int = 12
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.1
     bias: bool = True
     n_kv_head: int = 2
+    window = 124
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
@@ -27,97 +30,82 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_half_rotated = x_rot.flatten(-2)
     return (x * cos) + (x_half_rotated * sin)
 
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head masked self-attention with optional Flash Attention support."""
     def __init__(self, config, block_size, rope_base=10000.0):
         super().__init__()
-        self.n_head = config.n_head
-        self.head_size = config.n_embd // config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.dropout = config.dropout
-        self.n_embd = config.n_embd
-        C = self.n_embd
-        Dh = self.head_size
-        Hq = self.n_head
-        Hkv = self.n_kv_head
         T = block_size
+        C = config.n_embd
+        Hq = config.n_head
+        Hkv = config.n_kv_head
+        Dh = C // Hq
+        W = config.window
 
-        assert Dh % 2 == 0, "RoPE requires head_dim to be even."
-        assert Hq % Hkv == 0, "Number of query heads must be divisible by number of key/value heads."
+        self.c_attn = nn.Linear(C, (Hq+Hkv+Hkv)*Dh, bias=False)
+        self.c_proj = nn.Linear(C, C, bias=False)
+        causal_mask = torch.tril(torch.ones(T,T,dtype=torch.bool)).view(1,1,T,T)
+        #self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-        self.c_attn = nn.Linear(C, (Hq + 2 * Hkv) * Dh, bias=config.bias)
-        self.c_proj = nn.Linear(C, C, bias=config.bias)
-
-        self.dropout_1 = nn.Dropout(config.dropout)
-        self.dropout_2 = nn.Dropout(config.dropout)
-
-        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T)
-        self.register_buffer("causal_mask", causal_mask)
-
+        window_mask = torch.tril(torch.ones(T,T,dtype=torch.bool), diagonal=-W).view(1,1,T,T)
+        self.register_buffer("sliding_window", causal_mask & ~window_mask, persistent=False)
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
         rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
         self.register_buffer("rope_freqs", rope_freqs.permute(0, 1, 3, 2))
 
+        self.Hq, self.Hkv, self.Dh = Hq, Hkv, Dh
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd) 
-        print("B, T, C", B, T, C)
-        Dh = self.head_size
-        Hq = self.n_head
-        Hkv = self.n_kv_head
-        assert C % self.n_head == 0
-        print("Dh, Hq, Hkv", Dh, Hq, Hkv)
-        q, k, v = self.c_attn(x).split([Hq*Dh, Hkv*Dh, Hkv*Dh], dim=2)
-
-        Q = q.view(B, T, Hq, Dh)
-        Q = Q.transpose(1,2)
-
+        B, T, C = x.size()
+        Hq = self.Hq
+        Hkv = self.Hkv
+        Dh = self.Dh
+        
+        q,k,v = self.c_attn(x).split((Hq*Dh,Hkv*Dh,Hkv*Dh), 2)
+        Q = q.view(B, T, Hq, Dh).transpose(1,2)
         K = k.view(B, T, Hkv, Dh).transpose(1,2)
         V = v.view(B, T, Hkv, Dh).transpose(1,2)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
-        K = K.repeat_interleave(Hq // Hkv, dim=1)
-        V = V.repeat_interleave(Hq // Hkv, dim=1)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
 
-        print("self rope freqs shape", self.rope_freqs.shape)
         cos = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].cos(), 2, dim=-1)
         sin = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].sin(), 2, dim=-1)
         Q = apply_rope(Q, cos, sin)
         K = apply_rope(K, cos, sin)
 
-        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
-        print("causal mask shape", self.causal_mask.shape)
-        print("Q, K, V shape", (Q.shape, K.shape, V.shape))
+        Q = norm(Q)
+        K = norm(K)
 
-        attn = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
-        attn = F.softmax(attn, -1)
-        attn = self.dropout_1(attn) 
-        attn = attn @ V 
+        g = Hq // Hkv
+        Qg = Q.view(B,Hkv,g,T,Dh)
 
-        y = attn.transpose(2,1).reshape(B, T, C)
-        y = self.c_proj(y) 
-        y = self.dropout_2(y)
-        print("Attention output shape", y.shape)
+        scores = Qg @ K.unsqueeze(2).transpose(-1,-2) / math.sqrt(Dh)
+
+        scores = scores.masked_fill(~self.sliding_window[:,:,:T,:T].unsqueeze(2), float("-inf"))
+        attn = F.softmax(scores, -1)
+
+        y = attn @ V.unsqueeze(2)
+
+        y = y.permute(0, 3, 1, 2, 4).contiguous().view(B, T, Hq * Dh)
+        y = self.c_proj(y)
+        y = norm(y)
         return y
+
+
+
 
 
 class MLP(nn.Module):
     """Feedforward network used in the Transformer block."""
     def __init__(self, config):
         super().__init__()
-        self.lin = nn.Linear(config.n_embd, 4 * config.n_embd, config.bias)
-        self.GELU = nn.GELU()
-        self.proj = nn.Linear(4 * config.n_embd, config.n_embd, config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.expand = nn.Linear(config.n_embd, 4 * config.n_embd, config.bias)
+        self.reduce = nn.Linear(4 * config.n_embd, config.n_embd, config.bias)
 
     def forward(self, x):
-        print("MLP input shape", x.shape)
-        x = self.lin(x)
-        x = self.GELU(x)
-        x = self.proj(x)
-        x = self.dropout(x)
-        print("MLP output shape", x.shape)
+        x = self.expand(x)
+        x = F.relu(x).square()
+        x = self.reduce(x)
         return x
 
 class Block(nn.Module):
@@ -126,14 +114,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, block_size)
         self.MLP = MLP(config)
-        self.ln1 = nn.RMSNorm(config.n_embd)
-        self.ln2 = nn.RMSNorm(config.n_embd)
 
     def forward(self, x):
-        print("Block input shape", x.shape)
-        x = x + self.attn(self.ln1(x))
-        x = x + self.MLP(self.ln2(x))
-        print("Block output shape", x.shape)
+        x = x + self.attn(norm(x))
+        x = x + self.MLP(norm(x))
         return x
 
 class GPT(nn.Module):
@@ -143,14 +127,10 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(vocab_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, block_size) for _ in range(config.n_layer)]),
-            ln_f = nn.RMSNorm(config.n_embd, eps=1e-5),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, vocab_size, bias=False)
-
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         self.apply(self._init_weights)
 
@@ -160,27 +140,20 @@ class GPT(nn.Module):
 
 
     def forward(self, idx, targets=None):
-        print("===")
-        print("GPT input shape", idx.shape)
-        print("===")
         """idx and targets are (B,T), returns logits (B,T,vocab_size)"""
         device = idx.device
         b, t = idx.size()
-        print("idx:", idx)
 
-        tok_embd = self.transformer.wte(idx)
-        x = self.transformer.drop(tok_embd)
+        x = self.transformer.wte(idx)
+        x = norm(x)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = norm(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None
         else:
-            loss = F.cross_entropy(logits.permute(0, 2, 1).reshape(-1, logits.size(-1)), targets.reshape(-1))
-        print("===")
-        print("GPT ouput shape logits loss shape", (logits.shape, loss.shape))
-        print("===")
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
     
     def _init_weights(self, module):
@@ -266,9 +239,8 @@ m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
-print("block size", block_size)
 
-for iter in range(1):
+for iter in range(100):
     print("start")
     xb, yb = get_batch('train')
 
@@ -289,6 +261,6 @@ for iter in range(1):
 
 
 # generate from the model
-#context = torch.zeros((1, 1), dtype=torch.long, device=device)
-#print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))

@@ -47,7 +47,9 @@ class CausalSelfAttention(nn.Module):
         self.dropout_1 = nn.Dropout(config.dropout)
         self.dropout_2 = nn.Dropout(config.dropout)
 
-        self.register_buffer("causal_mask", torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T))
+        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T)
+        self.register_buffer("causal_mask", causal_mask)
+
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
         rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
@@ -74,19 +76,13 @@ class CausalSelfAttention(nn.Module):
         print("self rope freqs shape", self.rope_freqs.shape)
         cos = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].cos(), 2, dim=-1)
         sin = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].sin(), 2, dim=-1)
-        print("Q shape", Q.shape)
-        print("K shape", K.shape)
-        print("cos shape", cos.shape)
-        print("sin shape", sin.shape)
         Q = apply_rope(Q, cos, sin)
         K = apply_rope(K, cos, sin)
 
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
         print("causal mask shape", self.causal_mask.shape)
         print("Q, K, V shape", (Q.shape, K.shape, V.shape))
-        mask = self.causal_mask[:, :, :T, :T]      # (1,1,T,T)
-        valid = mask.any(dim=-1)                    # (1,1,T)
-        assert valid.all(), "Attention mask has invalid rows"
+
         attn = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
         attn = F.softmax(attn, -1)
         attn = self.dropout_1(attn) 

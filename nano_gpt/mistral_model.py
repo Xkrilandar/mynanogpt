@@ -8,24 +8,31 @@ import torch.nn.functional as F
 @dataclass
 class GPTConfig:
     """Configuration class for the GPT model."""
-    n_layer: int = 1
+    n_layer: int = 12
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.1
-    bias: bool = True
+    bias: bool = False
     n_kv_head: int = 2
+    window_size: int = 128
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),)) # 2nd parameter acts like a lambda
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """
-    x:   (B, n_head, T, head_dim)
-    cos: (1, 1, T, head_dim)
-    sin: (1, 1, T, head_dim)
-    """
     x_even = x[..., ::2]
     x_odd  = x[..., 1::2]
     x_rot = torch.stack((-x_odd, x_even), dim=-1)
     x_half_rotated = x_rot.flatten(-2)
     return (x * cos) + (x_half_rotated * sin)
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2 
+    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
+    y1 = x1 * cos + x2 * sin # rotate pairs of dims
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
     """Multi-head masked self-attention with optional Flash Attention support."""
@@ -41,6 +48,7 @@ class CausalSelfAttention(nn.Module):
         Hq = self.n_head
         Hkv = self.n_kv_head
         T = block_size
+        W = config.window_size
 
         assert Dh % 2 == 0, "RoPE requires head_dim to be even."
         assert Hq % Hkv == 0, "Number of query heads must be divisible by number of key/value heads."
@@ -51,15 +59,20 @@ class CausalSelfAttention(nn.Module):
         self.dropout_1 = nn.Dropout(config.dropout)
         self.dropout_2 = nn.Dropout(config.dropout)
 
-        self.register_buffer("causal_mask", torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T))
+        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
+        sliding_mask = ~torch.tril(torch.ones(T, T, dtype=torch.bool), diagonal=-W).view(1, 1, T, T)
+        self.register_buffer("sliding_window", causal_mask & sliding_mask, persistent=False)
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
         rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
-        self.register_buffer("rope_freqs", rope_freqs.permute(0, 1, 3, 2))
+        self.register_buffer("rope_freqs", rope_freqs.permute(0, 1, 3, 2), persistent=False)
 
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, past_kv=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd) 
+        present_kv = past_kv
         print("B, T, C", B, T, C)
         Dh = self.head_size
         Hq = self.n_head
@@ -83,21 +96,18 @@ class CausalSelfAttention(nn.Module):
         sin = torch.repeat_interleave(self.rope_freqs[:,:,:T,:].sin(), 2, dim=-1)
         Q = apply_rope(Q, cos, sin)
         K = apply_rope(K, cos, sin)
-
+        Q, K = norm(Q), norm(K)
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
         print("causal mask shape", self.causal_mask.shape)
+        print("sliding window shape", self.sliding_window.shape)
         print("Q, K, V shape", (Q.shape, K.shape, V.shape))
-        mask = self.causal_mask[:, :, :T, :T]      # (1,1,T,T)
-        valid = mask.any(dim=-1)                    # (1,1,T)
-        assert valid.all(), "Attention mask has invalid rows"
-        attn = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
+
+        attn = scores.masked_fill(self.sliding_window[:,:,:T,:T] == 0, float('-inf'))
         attn = F.softmax(attn, -1)
-        attn = self.dropout_1(attn) 
         attn = attn @ V 
 
         y = attn.transpose(2,1).reshape(B, T, C)
         y = self.c_proj(y) 
-        y = self.dropout_2(y)
         print("Attention output shape", y.shape)
         return y
 
@@ -107,16 +117,13 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.lin = nn.Linear(config.n_embd, 4 * config.n_embd, config.bias)
-        self.GELU = nn.GELU()
         self.proj = nn.Linear(4 * config.n_embd, config.n_embd, config.bias)
-        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         print("MLP input shape", x.shape)
         x = self.lin(x)
-        x = self.GELU(x)
+        x = F.relu(x).square()  # relu^2 activation in MLP
         x = self.proj(x)
-        x = self.dropout(x)
         print("MLP output shape", x.shape)
         return x
 
@@ -126,13 +133,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, block_size)
         self.MLP = MLP(config)
-        self.ln1 = nn.RMSNorm(config.n_embd)
-        self.ln2 = nn.RMSNorm(config.n_embd)
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, past_kv=None):
         print("Block input shape", x.shape)
-        x = x + self.attn(self.ln1(x))
-        x = x + self.MLP(self.ln2(x))
+        x = x + self.attn(norm(x), use_cache, past_kv)
+        x = x + self.MLP(norm(x))
         print("Block output shape", x.shape)
         return x
 
@@ -145,12 +150,11 @@ class GPT(nn.Module):
             wte = nn.Embedding(vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, block_size) for _ in range(config.n_layer)]),
-            ln_f = nn.RMSNorm(config.n_embd, eps=1e-5),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, vocab_size, bias=False)
 
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         self.apply(self._init_weights)
 
@@ -159,7 +163,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, use_cache=False, past_kv=None):
         print("===")
         print("GPT input shape", idx.shape)
         print("===")
@@ -169,18 +173,17 @@ class GPT(nn.Module):
         print("idx:", idx)
 
         tok_embd = self.transformer.wte(idx)
-        x = self.transformer.drop(tok_embd)
+        x = norm(tok_embd)
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x, use_cache, past_kv)
+        x = norm(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None
         else:
             loss = F.cross_entropy(logits.permute(0, 2, 1).reshape(-1, logits.size(-1)), targets.reshape(-1))
-        print("===")
-        print("GPT ouput shape logits loss shape", (logits.shape, loss.shape))
-        print("===")
+
         return logits, loss
     
     def _init_weights(self, module):
@@ -192,18 +195,17 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=False, past_kv=None):
         """return idx + new tokens predicted"""
         for _ in range(max_new_tokens):
             logits, loss = self.forward(idx, None)
-            logits = logits[:,-1,:] / max(temperature,1e-8)
             if top_k is not None:
-                logits = torch.topk(logits, top_k)
-                logits = logits.values
-
+                v, _ = torch.topk(logits, k=top_k, dim=-1)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            logits = logits[:,-1,:] / max(temperature,1e-8)
             probs = F.softmax(logits, -1)
             next_token = torch.multinomial(probs, 1)
-            idx = torch.cat([idx,next_token],dim=1)
+            idx = torch.cat((idx,next_token),dim=1)
         return idx
 
 
@@ -289,6 +291,6 @@ for iter in range(1):
 
 
 # generate from the model
-#context = torch.zeros((1, 1), dtype=torch.long, device=device)
-#print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))

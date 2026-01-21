@@ -14,6 +14,7 @@ class GPTConfig:
     dropout: float = 0.1
     bias: bool = True
     n_kv_head: int = 2
+    window_size: int = 128
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
@@ -41,6 +42,7 @@ class CausalSelfAttention(nn.Module):
         Hq = self.n_head
         Hkv = self.n_kv_head
         T = block_size
+        W = config.window_size
 
         assert Dh % 2 == 0, "RoPE requires head_dim to be even."
         assert Hq % Hkv == 0, "Number of query heads must be divisible by number of key/value heads."
@@ -54,6 +56,8 @@ class CausalSelfAttention(nn.Module):
         causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool)).view(1, 1, T, T)
         self.register_buffer("causal_mask", causal_mask)
 
+        sliding_mask = ~torch.tril(torch.ones(T, T, dtype=torch.bool), diagonal=-W).view(1, 1, T, T)
+        self.register_buffer("sliding_window", causal_mask & sliding_mask)
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, Dh, 2, dtype=torch.float32) / Dh))
         rope_freqs = inv_freq[None, None, :, None] * torch.arange(T, dtype=torch.float32)[None, None, None, :]
@@ -88,9 +92,10 @@ class CausalSelfAttention(nn.Module):
 
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_size)
         print("causal mask shape", self.causal_mask.shape)
+        print("sliding window shape", self.sliding_window.shape)
         print("Q, K, V shape", (Q.shape, K.shape, V.shape))
 
-        attn = scores.masked_fill(self.causal_mask[:,:,:T,:T] == 0, float('-inf'))
+        attn = scores.masked_fill(self.sliding_window[:,:,:T,:T] == 0, float('-inf'))
         attn = F.softmax(attn, -1)
         attn = self.dropout_1(attn) 
         attn = attn @ V 
